@@ -76,7 +76,7 @@
 <div id="hud" class="off"></div>
 
 <div id="panel" class="off">
-  <label>Schwelle <input id="thr" type="range" min="10" max="90" value="55" step="5"><span id="thrV">55%</span></label>
+  <label>Schwelle <input id="thr" type="range" min="10" max="90" value="40" step="5"><span id="thrV">40%</span></label>
   <label>Kamera <select id="camPick2"></select></label>
   <label>Labels <select id="mode">
     <option value="2">Name + Wert</option>
@@ -93,8 +93,8 @@
 <script>
 const $ = s => document.querySelector(s);
 const video = $('#cam'), cv = $('#overlay'), ctx = cv.getContext('2d');
-let model, tracks = [], nextId = 1, threshold = .55, labelMode = 2, mirror = false;
-let fps = 0, lastT = performance.now(), running = false;
+let model, tracks = [], nextId = 1, threshold = .40, labelMode = 2, mirror = false;
+let fps = 0, lastT = performance.now(), running = false, lastErr = '';
 
 function fail(msg){
   const d = document.createElement('div');
@@ -131,9 +131,19 @@ async function openCam(deviceId){
   }
   video.srcObject = stream;
   await video.play();
-  $('#stage').style.aspectRatio = video.videoWidth + '/' + video.videoHeight;
-  cv.width = video.videoWidth; cv.height = video.videoHeight;
+  if (!video.videoWidth){                       // Maße kommen manchmal verspätet
+    await new Promise(r => video.addEventListener('loadedmetadata', r, {once:true}));
+  }
+  syncSize();
   await listCams();
+}
+
+function syncSize(){
+  if (!video.videoWidth) return;
+  if (cv.width !== video.videoWidth || cv.height !== video.videoHeight){
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    $('#stage').style.aspectRatio = video.videoWidth + '/' + video.videoHeight;
+  }
 }
 
 /* ---------- Tracking: Boxen ruhig halten ---------- */
@@ -203,16 +213,23 @@ function draw(){
 /* ---------- Schleife ---------- */
 async function loop(){
   if (!running) return;
-  if (video.readyState >= 2){
+  syncSize();
+  if (video.readyState >= 2 && cv.width){
+    let raw = [];
     try {
-      const preds = await model.detect(video, 20, threshold);
-      update(preds);
-    } catch(e){ /* einzelne Frames dürfen scheitern */ }
+      raw = await model.detect(video, 20, .12);      // niedrig abfragen, lokal filtern
+      lastErr = '';
+    } catch(e){ lastErr = e.name + ': ' + e.message; }
+    update(raw.filter(p => p.score >= threshold));
     draw();
     const now = performance.now();
     fps += ((1000/(now-lastT)) - fps) * .15; lastT = now;
-    $('#hud').innerHTML = '<b>' + tracks.length + '</b> erkannt<br>' +
-      Math.round(fps) + ' fps · Schwelle ' + Math.round(threshold*100) + '%';
+    $('#hud').innerHTML = '<b>' + tracks.length + '</b> über Schwelle · ' + raw.length + ' roh<br>' +
+      Math.round(fps) + ' fps · Schwelle ' + Math.round(threshold*100) + '% · ' +
+      cv.width + '×' + cv.height +
+      (lastErr ? '<br>Fehler: ' + lastErr : '');
+  } else {
+    $('#hud').innerHTML = 'warte auf Kamerabild …';
   }
   requestAnimationFrame(loop);
 }
