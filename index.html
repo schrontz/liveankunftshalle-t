@@ -168,11 +168,11 @@ function update(preds){
       best.score += (p.score - best.score) * .3;
       best.seen = true; best.miss = 0; best.alpha = Math.min(1, best.alpha + .18);
     } else {
-      tracks.push({id:nextId++, cls:p.class, box:p.bbox.slice(), score:p.score, seen:true, miss:0, alpha:0});
+      tracks.push({id:nextId++, cls:p.class, box:p.bbox.slice(), score:p.score, seen:true, miss:0, alpha:.3});
     }
   }
   for (const t of tracks) if (!t.seen){ t.miss++; t.alpha -= .12; }
-  tracks = tracks.filter(t => t.miss < 8 && t.alpha > 0);
+  tracks = tracks.filter(t => t.miss < 8 && (t.seen || t.alpha > 0));
 }
 
 /* ---------- Zeichnen ---------- */
@@ -224,7 +224,7 @@ async function loop(){
     draw();
     const now = performance.now();
     fps += ((1000/(now-lastT)) - fps) * .15; lastT = now;
-    $('#hud').innerHTML = '<b>' + tracks.length + '</b> über Schwelle · ' + raw.length + ' roh<br>' +
+    $('#hud').innerHTML = '<b>v3</b> · <b>' + tracks.length + '</b> über Schwelle · ' + raw.length + ' roh<br>' +
       Math.round(fps) + ' fps · Schwelle ' + Math.round(threshold*100) + '% · ' +
       cv.width + '×' + cv.height +
       (lastErr ? '<br>Fehler: ' + lastErr : '');
