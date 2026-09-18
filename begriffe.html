@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Live-Klassifikation · eigene Begriffe</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  :root{--bone:#F2EDE4;--dim:rgba(242,237,228,.45)}
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{background:#000;color:var(--bone);
+    font-family:"IBM Plex Sans Condensed",-apple-system,"Segoe UI",sans-serif;
+    display:grid;place-items:center;overflow:hidden}
+  body.hide-cursor{cursor:none}
+  #stage{position:relative;max-width:100vw;max-height:100vh;aspect-ratio:16/9}
+  #cam{display:block;width:100%;height:100%;object-fit:cover;background:#000}
+  #cam.mirror{transform:scaleX(-1)}
+  #overlay{position:absolute;inset:0;width:100%;height:100%}
+
+  #start{position:fixed;inset:0;display:grid;align-content:start;gap:18px;
+    background:#000;padding:32px 24px;max-width:560px;margin:auto;overflow:auto}
+  h1{font-size:26px;font-weight:600}
+  p{color:var(--dim);font-size:15px;line-height:1.5}
+  textarea{width:100%;min-height:150px;background:#0d0d0d;color:var(--bone);
+    border:1px solid var(--dim);padding:10px;font:inherit;font-size:15px;line-height:1.6}
+  button{font:inherit;font-size:17px;font-weight:600;color:#000;background:var(--bone);
+    border:0;padding:12px 20px;cursor:pointer;justify-self:start}
+  button:disabled{opacity:.5;cursor:default}
+  select,input[type=range]{font:inherit;color:var(--bone);background:transparent;
+    border:1px solid var(--dim);padding:6px 8px;max-width:100%}
+  select option{background:#000}
+  label{display:flex;gap:8px;align-items:center;color:var(--dim);font-size:14px}
+
+  #hud{position:fixed;top:16px;left:18px;font-size:14px;line-height:1.6;color:var(--dim);
+    pointer-events:none;font-variant-numeric:tabular-nums;max-width:70vw}
+  #hud b{color:var(--bone);font-weight:600}
+  #panel{position:fixed;bottom:14px;left:18px;right:18px;display:flex;flex-wrap:wrap;
+    gap:8px 18px;align-items:center}
+  #panel textarea{min-height:52px;flex:1 1 240px}
+  .off{display:none !important}
+  #err{position:fixed;top:0;left:0;right:0;padding:12px 18px;background:var(--bone);
+    color:#000;font-size:15px;z-index:9;line-height:1.4}
+</style>
+</head>
+<body>
+
+<div id="stage" class="off">
+  <video id="cam" autoplay playsinline muted></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div id="start">
+  <h1>Eigene Begriffe</h1>
+  <p>Ein Begriff pro Zeile. Das Modell versteht nur Englisch, und kurze Beschreibungen
+     treffen besser als einzelne Wörter: „a worn leather suitcase“ schlägt „suitcase“.</p>
+  <textarea id="terms">a suitcase
+a person waiting
+an empty bench
+a paper coffee cup
+a departure board
+a potted plant
+a clock on the wall</textarea>
+  <label style="flex-direction:column;align-items:stretch">Kamera
+    <select id="camPick"><option value="">Standardkamera</option></select>
+  </label>
+  <button id="go">Starten</button>
+  <p id="note">Beim ersten Start lädt das Modell rund 90 MB. Über Mobilfunk dauert das,
+     danach liegt es im Zwischenspeicher des Browsers.</p>
+</div>
+
+<div id="hud" class="off"></div>
+
+<div id="panel" class="off">
+  <textarea id="terms2" title="Begriffe, ein Begriff pro Zeile"></textarea>
+  <button id="apply" style="font-size:14px;padding:8px 14px">Übernehmen</button>
+  <label>Schwelle <input id="thr" type="range" min="2" max="60" value="12" step="1"><span id="thrV">12%</span></label>
+  <label>Labels <select id="mode">
+    <option value="2">Name + Wert</option>
+    <option value="1">nur Name</option>
+    <option value="0">nur Kasten</option>
+  </select></label>
+  <label><input id="mir" type="checkbox"> Spiegeln</label>
+</div>
+
+<script type="module">
+import { pipeline, env } from 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3';
+
+const $ = s => document.querySelector(s);
+const video = $('#cam'), cv = $('#overlay'), ctx = cv.getContext('2d');
+const work = document.createElement('canvas');          // verkleinerte Kopie fürs Modell
+const wctx = work.getContext('2d');
+
+let detector, labels = [], tracks = [], nextId = 1;
+let threshold = .12, labelMode = 2, mirror = false;
+let running = false, lastErr = '', took = 0, backend = '', hold = 900;
+
+function fail(msg){
+  let d = $('#err');
+  if (!d){ d = document.createElement('div'); d.id = 'err'; document.body.appendChild(d); }
+  d.textContent = msg;
+}
+
+/* ---------- Kamera ---------- */
+async function listCams(){
+  const devs = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  const sel = $('#camPick'); const keep = sel.value;
+  sel.innerHTML = '';
+  devs.forEach((d,i) => {
+    const o = document.createElement('option');
+    o.value = d.deviceId; o.textContent = d.label || ('Kamera ' + (i+1));
+    sel.appendChild(o);
+  });
+  if (keep) sel.value = keep;
+}
+
+async function openCam(deviceId){
+  if (video.srcObject) video.srcObject.getTracks().forEach(t => t.stop());
+  const size = {width:{ideal:1280}, height:{ideal:720}};
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: deviceId ? Object.assign({deviceId:{exact:deviceId}}, size) : size, audio:false});
+  } catch(e){
+    if (!deviceId) throw e;
+    stream = await navigator.mediaDevices.getUserMedia({video:size, audio:false});
+  }
+  video.srcObject = stream;
+  await video.play();
+  if (!video.videoWidth) await new Promise(r => video.addEventListener('loadedmetadata', r, {once:true}));
+  syncSize();
+  await listCams();
+}
+
+function syncSize(){
+  if (!video.videoWidth) return;
+  if (cv.width !== video.videoWidth){
+    cv.width = video.videoWidth; cv.height = video.videoHeight;
+    $('#stage').style.aspectRatio = video.videoWidth + '/' + video.videoHeight;
+    const scale = 640 / Math.max(video.videoWidth, video.videoHeight);
+    work.width = Math.round(video.videoWidth * scale);
+    work.height = Math.round(video.videoHeight * scale);
+  }
+}
+
+/* ---------- Verfolgung ---------- */
+const iou = (a,b) => {
+  const x1 = Math.max(a[0],b[0]), y1 = Math.max(a[1],b[1]);
+  const x2 = Math.min(a[0]+a[2], b[0]+b[2]), y2 = Math.min(a[1]+a[3], b[1]+b[3]);
+  const i = Math.max(0,x2-x1) * Math.max(0,y2-y1);
+  return i / (a[2]*a[3] + b[2]*b[3] - i || 1);
+};
+function hueFor(s){ let h=0; for (let i=0;i<s.length;i++) h=(h*31+s.charCodeAt(i))%360; return h; }
+
+function update(preds){
+  const now = performance.now();
+  tracks.forEach(t => t.seen = false);
+  for (const p of preds){
+    let best = null, bestScore = .2;
+    for (const t of tracks){
+      if (t.cls !== p.cls || t.seen) continue;
+      const s = iou(t.box, p.box);
+      if (s > bestScore){ bestScore = s; best = t; }
+    }
+    if (best){
+      best.box = best.box.map((v,i) => v + (p.box[i]-v)*.5);
+      best.score += (p.score - best.score)*.4;
+      best.seen = true; best.last = now; best.alpha = Math.min(1, best.alpha + .4);
+    } else {
+      tracks.push({id:nextId++, cls:p.cls, box:p.box.slice(), score:p.score,
+                   seen:true, last:now, alpha:.4, hue:hueFor(p.cls)});
+    }
+  }
+  for (const t of tracks) if (!t.seen) t.alpha = Math.max(0, 1 - (now - t.last)/hold);
+  tracks = tracks.filter(t => t.seen || now - t.last < hold);
+}
+
+/* ---------- Zeichnen ---------- */
+function draw(){
+  const W = cv.width;
+  if (!W) return;
+  ctx.clearRect(0,0,W,cv.height);
+  const s = W/1280, fs = Math.max(13, Math.round(19*s));
+  ctx.lineWidth = Math.max(1.5, 2*s);
+  ctx.font = '600 ' + fs + 'px "IBM Plex Sans Condensed", sans-serif';
+
+  for (const t of tracks){
+    let [x,y,w,h] = t.box;
+    if (mirror) x = W - x - w;
+    const col = 'hsl(' + t.hue + ' 90% 62%)';
+    ctx.globalAlpha = Math.max(0, Math.min(1, t.alpha));
+    ctx.strokeStyle = col;
+    ctx.strokeRect(x, y, w, h);
+    if (labelMode > 0){
+      const txt = labelMode === 2 ? t.cls + '  ' + Math.round(t.score*100) : t.cls;
+      const padX = 7*s, padY = 5*s, tw = ctx.measureText(txt).width, bh = fs + padY*2;
+      const by = y - bh < 0 ? y : y - bh;
+      ctx.fillStyle = col; ctx.fillRect(x, by, tw + padX*2, bh);
+      ctx.fillStyle = '#000'; ctx.fillText(txt, x + padX, by + bh - padY - 2*s);
+    }
+  }
+  ctx.globalAlpha = 1;
+}
+
+function paint(){ if (!running) return; draw(); requestAnimationFrame(paint); }
+
+/* ---------- Erkennung ---------- */
+function readTerms(el){
+  return el.value.split('\n').map(s => s.trim()).filter(Boolean).slice(0, 20);
+}
+
+async function detectLoop(){
+  while (running){
+    if (video.readyState < 2 || !labels.length){ await new Promise(r => setTimeout(r, 120)); continue; }
+    syncSize();
+    const t0 = performance.now();
+    try {
+      wctx.drawImage(video, 0, 0, work.width, work.height);
+      const out = await detector(work.toDataURL('image/jpeg', .85), labels,
+                                {threshold: .02, percentage: true});
+      const preds = out
+        .filter(o => o.score >= threshold)
+        .map(o => ({
+          cls: o.label,
+          score: o.score,
+          box: [o.box.xmin*cv.width, o.box.ymin*cv.height,
+                (o.box.xmax-o.box.xmin)*cv.width, (o.box.ymax-o.box.ymin)*cv.height]
+        }));
+      update(preds);
+      lastErr = '';
+    } catch(e){
+      lastErr = (e.name || 'Fehler') + ': ' + e.message;
+      await new Promise(r => setTimeout(r, 400));
+    }
+    took = performance.now() - t0;
+    hold = Math.max(700, took * 1.8);        // Kästen überbrücken die Wartezeit
+    $('#hud').innerHTML = '<b>v1</b> · <b>' + tracks.length + '</b> sichtbar · ' +
+      labels.length + ' Begriffe<br>' +
+      (took/1000).toFixed(1) + ' s pro Bild · ' + backend + ' · Schwelle ' +
+      Math.round(threshold*100) + '%' + (lastErr ? '<br>Fehler: ' + lastErr : '');
+  }
+}
+
+/* ---------- Start ---------- */
+$('#go').addEventListener('click', async () => {
+  const btn = $('#go');
+  btn.disabled = true;
+  labels = readTerms($('#terms'));
+  if (!labels.length){ fail('Bitte mindestens einen Begriff eintragen.'); btn.disabled = false; return; }
+  $('#terms2').value = $('#terms').value;
+
+  try {
+    btn.textContent = 'Kamera …';
+    await openCam($('#camPick').value || undefined);
+  } catch(e){
+    const hint = {NotAllowedError:'Kamerazugriff blockiert — im Schloss-Symbol der Adresszeile erlauben.',
+                  NotReadableError:'Kamera wird von einem anderen Programm benutzt.',
+                  NotFoundError:'Keine Kamera gefunden.'}[e.name] || (e.name + ': ' + e.message);
+    fail(hint); btn.disabled = false; btn.textContent = 'Starten'; return;
+  }
+
+  const onProgress = p => {
+    if (p.status === 'progress' && p.total)
+      btn.textContent = 'Modell ' + Math.round(p.loaded/p.total*100) + ' %';
+  };
+  try {
+    detector = await pipeline('zero-shot-object-detection', 'Xenova/owlvit-base-patch32',
+                              {device:'webgpu', dtype:'q8', progress_callback:onProgress});
+    backend = 'WebGPU';
+  } catch(e1){
+    try {
+      btn.textContent = 'Modell (ohne WebGPU) …';
+      detector = await pipeline('zero-shot-object-detection', 'Xenova/owlvit-base-patch32',
+                                {dtype:'q8', progress_callback:onProgress});
+      backend = 'CPU';
+    } catch(e2){
+      fail('Modell konnte nicht geladen werden: ' + e2.message);
+      btn.disabled = false; btn.textContent = 'Starten'; return;
+    }
+  }
+
+  $('#start').classList.add('off');
+  ['#stage','#hud','#panel'].forEach(s => $(s).classList.remove('off'));
+  running = true;
+  $('#hud').textContent = 'erste Erkennung läuft …';
+  paint(); detectLoop();
+});
+
+/* ---------- Bedienung ---------- */
+$('#apply').addEventListener('click', () => {
+  const t = readTerms($('#terms2'));
+  if (t.length){ labels = t; tracks = []; }
+});
+$('#thr').addEventListener('input', e => {
+  threshold = e.target.value/100; $('#thrV').textContent = e.target.value + '%';
+});
+$('#mode').addEventListener('change', e => labelMode = +e.target.value);
+$('#mir').addEventListener('change', e => {
+  mirror = e.target.checked; video.classList.toggle('mirror', mirror);
+});
+addEventListener('keydown', e => {
+  if (['TEXTAREA','SELECT','INPUT'].includes(e.target.tagName)) return;
+  const k = e.key.toLowerCase();
+  if (k === 'h'){
+    const hidden = $('#panel').classList.toggle('off');
+    $('#hud').classList.toggle('off', hidden);
+    document.body.classList.toggle('hide-cursor', hidden);
+  }
+  if (k === 'f') document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+});
+
+navigator.mediaDevices?.enumerateDevices && listCams();
+</script>
+</body>
+</html>
